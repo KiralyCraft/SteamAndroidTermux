@@ -1,0 +1,15 @@
+# Downloaded and installed Valve payloads
+/Steam/
+/downloads/
+/steam_client_steamdeck_publicbeta_linuxarm64
+
+# Diagnostic output and runtime state
+/*.log
+/steam-bootstrap-strace/
+/steam-shim-trace-*/
+/__pycache__/
+*.py[cod]
+
+# Locally built shim artifacts
+/sysvipc-shim/*.so
+/sysvipc-shim/test_sysvsem
