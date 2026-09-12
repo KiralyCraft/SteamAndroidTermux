@@ -517,6 +517,7 @@ def read_cached_games(appinfo_path: Path) -> list[dict[str, object]]:
         value, position = _read_c_string(data, position, len(data))
         strings.append(value)
 
+    active_beta_keys = read_active_beta_keys(appinfo_path)
     games: list[dict[str, object]] = []
     position = 16
     while position + 8 <= string_table_offset:
@@ -560,9 +561,21 @@ def read_cached_games(appinfo_path: Path) -> list[dict[str, object]]:
                         if not isinstance(launch_option, dict):
                             continue
                         launch_config = launch_option.get("config", {})
-                        launch_oslist = ""
+                        launch_oslist = (
+                            str(oslist)
+                            if "windows" in advertised_platforms
+                            and "linux" not in advertised_platforms
+                            else ""
+                        )
                         if isinstance(launch_config, dict):
-                            launch_oslist = str(launch_config.get("oslist", ""))
+                            beta_key = str(launch_config.get("BetaKey", ""))
+                            if beta_key and (
+                                active_beta_keys.get(app_id, "").casefold()
+                                != beta_key.casefold()
+                            ):
+                                continue
+                            if "oslist" in launch_config:
+                                launch_oslist = str(launch_config["oslist"])
                         executable = launch_option.get("executable", "")
                         if (
                             isinstance(executable, str)
@@ -723,6 +736,23 @@ CONTENT_TOTAL_PATTERN = re.compile(
     r"(?P<bytes>\d+) Bytes, (?P<duration>\d+) sec",
     re.MULTILINE,
 )
+
+
+def read_active_beta_keys(appinfo_path: Path) -> dict[int, str]:
+    """Return the selected Steam beta key for each locally manifested app."""
+    steamapps = appinfo_path.parent.parent / "steamapps"
+    active: dict[int, str] = {}
+    for manifest in steamapps.glob("appmanifest_*.acf"):
+        try:
+            app_id = int(manifest.stem.removeprefix("appmanifest_"))
+            text = manifest.read_text(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            continue
+        for key, value in ACF_FIELD_PATTERN.findall(text):
+            if key == "BetaKey" and value:
+                active[app_id] = value
+                break
+    return active
 
 
 def _content_log_timestamp(value: str) -> float:
