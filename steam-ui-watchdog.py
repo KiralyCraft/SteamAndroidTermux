@@ -20,10 +20,13 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 
 LOGGED_IN_STATE = 5
 WAITING_FOR_LIBRARY_STATE = 4
+APPINFO_MAGIC = 0x07564429
+APPINFO_RECORD_HEADER_SIZE = 68
 
 
 class CDPError(RuntimeError):
@@ -204,6 +207,231 @@ COMPLETE_LOGIN_EXPRESSION = """(async()=>{
 })()"""
 
 
+def _read_c_string(data: bytes, position: int, limit: int) -> tuple[str, int]:
+    end = data.find(b"\0", position, limit)
+    if end < 0:
+        raise ValueError("unterminated appinfo string")
+    return data[position:end].decode("utf-8", "replace"), end + 1
+
+
+def _read_appinfo_object(
+    data: bytes, position: int, limit: int, strings: list[str]
+) -> tuple[dict[str, object], int]:
+    result: dict[str, object] = {}
+    while position < limit:
+        value_type = data[position]
+        position += 1
+        if value_type == 8:
+            return result, position
+
+        key_index = struct.unpack_from("<I", data, position)[0]
+        position += 4
+        if key_index >= len(strings):
+            raise ValueError("invalid appinfo string-table index")
+        key = strings[key_index]
+
+        if value_type == 0:
+            value, position = _read_appinfo_object(data, position, limit, strings)
+        elif value_type == 1:
+            value, position = _read_c_string(data, position, limit)
+        elif value_type == 2:
+            value = struct.unpack_from("<I", data, position)[0]
+            position += 4
+        elif value_type == 3:
+            value = struct.unpack_from("<f", data, position)[0]
+            position += 4
+        elif value_type == 4:
+            value = struct.unpack_from("<I", data, position)[0]
+            position += 4
+        elif value_type == 5:
+            length = struct.unpack_from("<H", data, position)[0]
+            position += 2
+            byte_length = length * 2
+            value = data[position : position + byte_length].decode("utf-16le", "replace")
+            value = value.rstrip("\0")
+            position += byte_length
+        elif value_type == 6:
+            value = data[position : position + 4]
+            position += 4
+        elif value_type == 7:
+            value = struct.unpack_from("<Q", data, position)[0]
+            position += 8
+        elif value_type == 10:
+            value = struct.unpack_from("<q", data, position)[0]
+            position += 8
+        elif value_type == 11:
+            value = struct.unpack_from("<Q", data, position)[0]
+            position += 8
+        else:
+            raise ValueError(f"unsupported appinfo value type {value_type}")
+        result[key] = value
+    raise ValueError("unterminated appinfo object")
+
+
+def read_cached_games(appinfo_path: Path) -> list[dict[str, object]]:
+    data = appinfo_path.read_bytes()
+    if len(data) < 20 or struct.unpack_from("<I", data)[0] != APPINFO_MAGIC:
+        raise ValueError("unsupported appinfo cache format")
+
+    string_table_offset = struct.unpack_from("<Q", data, 8)[0]
+    if string_table_offset < 20 or string_table_offset >= len(data):
+        raise ValueError("invalid appinfo string-table offset")
+    string_count = struct.unpack_from("<I", data, string_table_offset)[0]
+    position = string_table_offset + 4
+    strings: list[str] = []
+    for _ in range(string_count):
+        value, position = _read_c_string(data, position, len(data))
+        strings.append(value)
+
+    games: list[dict[str, object]] = []
+    position = 16
+    while position + 8 <= string_table_offset:
+        app_id, record_size = struct.unpack_from("<II", data, position)
+        if app_id == 0:
+            break
+        next_record = position + 8 + record_size
+        value_position = position + APPINFO_RECORD_HEADER_SIZE
+        if value_position >= next_record or next_record > string_table_offset:
+            raise ValueError("invalid appinfo record size")
+        root, _ = _read_appinfo_object(data, value_position, next_record, strings)
+        appinfo = root.get("appinfo", root)
+        common = appinfo.get("common", {}) if isinstance(appinfo, dict) else {}
+        if isinstance(common, dict):
+            name = common.get("name")
+            app_type = common.get("type")
+            if (
+                isinstance(name, str)
+                and name
+                and isinstance(app_type, str)
+                and app_type.casefold() == "game"
+            ):
+                games.append({"appid": app_id, "name": name})
+        position = next_record
+
+    games.sort(key=lambda game: str(game["name"]).casefold())
+    return games
+
+
+def find_appinfo_path(pid: int | None) -> Path | None:
+    candidates: list[Path] = []
+    if pid is not None:
+        try:
+            executable = Path(os.readlink(f"/proc/{pid}/exe"))
+            candidates.append(executable.parent.parent / "appcache" / "appinfo.vdf")
+        except OSError:
+            pass
+    script_root = Path(__file__).resolve().parent
+    candidates.extend(
+        (
+            script_root / "Steam" / "appcache" / "appinfo.vdf",
+            Path.cwd() / "Steam" / "appcache" / "appinfo.vdf",
+        )
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def build_library_repair_expression(games: list[dict[str, object]]) -> str:
+    candidates = json.dumps(games, ensure_ascii=True, separators=(",", ":"))
+    return f"""(async()=>{{
+  try {{
+    if (!globalThis.__arm64WebpackRequire) {{
+      globalThis.webpackChunksteamui.push([
+        [987654322], {{}}, require => globalThis.__arm64WebpackRequire = require
+      ]);
+    }}
+    const require = globalThis.__arm64WebpackRequire;
+    const store = require(1776).tw;
+    const Change = require(59865).bs;
+    if (!store || !Change || !globalThis.SteamClient?.Apps)
+      return {{accepted:false, reason:"Steam app store unavailable"}};
+    const candidates = {candidates};
+    const uncached = candidates.filter(app =>
+      !store.GetAppOverviewByAppID(app.appid)
+    );
+    if (!uncached.length)
+      return {{accepted:true, injected:0, total:store.m_mapApps?.size || 0}};
+    const checks = await Promise.all(uncached.map(async app => {{
+      try {{
+        return await SteamClient.Apps.GetIsSubscribedApp(app.appid) ? app : null;
+      }} catch (_) {{
+        return null;
+      }}
+    }}));
+    const missing = checks.filter(app => app);
+    if (!missing.length)
+      return {{accepted:true, injected:0, total:store.m_mapApps?.size || 0}};
+    const change = Change.fromObject({{
+      app_overview: missing.map(app => ({{
+        appid: app.appid,
+        display_name: app.name,
+        display_name_elanguage: 0,
+        visible_in_game_list: true,
+        subscribed_to: true,
+        sort_as: app.name,
+        app_type: 1,
+        gameid: String(app.appid),
+        per_client_data: [{{
+          clientid: "0",
+          client_name: "Local Computer",
+          display_status: 0,
+          status_percentage: 0,
+          installed: false,
+          is_available_on_current_platform: true,
+          is_invalid_os_type: false
+        }}],
+        most_available_clientid: "0",
+        selected_clientid: "0",
+        number_of_copies: 1
+      }})),
+      full_update: false,
+      update_complete: true
+    }});
+    const accepted = !!store.UpdateAppOverview(change.serializeBinary());
+    if (accepted)
+      store.m_bIsInitialized = true;
+    return {{accepted, injected:missing.length, total:store.m_mapApps?.size || 0}};
+  }} catch (error) {{
+    return {{accepted:false, reason:String(error)}};
+  }}
+}})()"""
+
+
+def repair_visual_library(port: int, pid: int | None) -> None:
+    appinfo_path = find_appinfo_path(pid)
+    if appinfo_path is None:
+        log("local appinfo cache not found; visual Library repair was skipped")
+        return
+    try:
+        games = read_cached_games(appinfo_path)
+    except (OSError, ValueError, struct.error) as error:
+        log(
+            "could not read local appinfo cache; "
+            f"visual Library repair was skipped: {error}"
+        )
+        return
+    if not games:
+        log("local appinfo cache contains no games; visual Library repair was skipped")
+        return
+    result = evaluate(
+        port, build_library_repair_expression(games), await_promise=True
+    )
+    if not isinstance(result, dict) or not result.get("accepted"):
+        reason = (
+            result.get("reason", "unknown error")
+            if isinstance(result, dict)
+            else "unknown error"
+        )
+        log(f"visual Library repair was not accepted: {reason}")
+        return
+    injected = int(result.get("injected", 0))
+    total = int(result.get("total", 0))
+    if injected:
+        log(f"restored {injected} owned games to the visual Library ({total} total)")
+
+
 def get_state(port: int) -> dict | None:
     value = evaluate(port, STATE_EXPRESSION)
     return value if isinstance(value, dict) else None
@@ -240,6 +468,7 @@ def run(port: int, pid: int | None, startup_timeout: float) -> int:
             continue
         if state.get("loginState") == LOGGED_IN_STATE:
             log("Steam reached the logged-in UI state")
+            repair_visual_library(port, pid)
             return 0
         if state.get("loginState") != WAITING_FOR_LIBRARY_STATE:
             waiting_since = None
@@ -284,6 +513,7 @@ def run(port: int, pid: int | None, startup_timeout: float) -> int:
 
     if evaluate(port, COMPLETE_LOGIN_EXPRESSION, await_promise=True):
         log("completed the missed logged-in UI handoff")
+        repair_visual_library(port, pid)
         return 0
     log("could not complete the logged-in UI handoff")
     return 1

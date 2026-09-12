@@ -38,6 +38,14 @@ then performs the missed UI initialization through Steam's localhost-only CEF
 debugger. If the unavailable Friends Chat interface leaves its optional startup
 promise pending, the watchdog releases that gate after its built-in timeout.
 
+The same native failure can leave SteamUI's app-overview store initialized but
+empty. After completing the login handoff, the watchdog reads game names and
+AppIDs from Steam's local `appcache/appinfo.vdf`, asks the logged-in native
+client which entries are subscribed, and restores only those owned games to the
+visual Library. This is a presentation workaround: it does not fabricate
+licenses, and it does not repair Steam's native platform-data/install-manager
+state.
+
 The workaround does not read or print credentials and exits after the UI is
 ready. Disable it for an unmodified diagnostic launch with:
 
@@ -60,7 +68,7 @@ mount and prints the command needed to restore it.
   symlink, regular-file, and size records.
 - `run-steam-arm64.sh` supplies the local runtime paths and semaphore preload.
 - `steam-ui-watchdog.py` recovers the ARM64 client's missed post-login UI
-  handoff without external Python packages.
+  handoff and empty visual Library without external Python packages.
 - `sysvipc-shim/` contains the C source, test program, and build rules.
 
 Steam itself, downloaded archives, logs, traces, and generated binaries are
