@@ -27,4 +27,4 @@ export LD_PRELOAD="${sysvsem_shim}${LD_PRELOAD:+:${LD_PRELOAD}}"
 export PATH="${steam_runtime_bin}:${PATH}"
 
 cd "${steam_arm_dir}"
-exec "${steam_arm_dir}/steam" -steamdeck "$@"
+exec "${steam_arm_dir}/steam" "$@"

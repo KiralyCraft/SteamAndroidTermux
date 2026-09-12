@@ -30,6 +30,10 @@ Then start the installed client:
 ./run-steam-arm64.sh
 ```
 
+The launcher intentionally starts Steam's desktop UI. Passing `-steamdeck`
+forces the SteamOS Gaming Mode shell, which depends on platform components that
+are not present in this chroot and can remain stuck on its startup spinner.
+
 The mount is intentionally not persistent. The launcher detects a missing
 mount and prints the command needed to restore it.
 
