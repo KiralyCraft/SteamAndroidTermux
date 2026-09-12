@@ -83,6 +83,7 @@ SteamAndroidTermux/
 │   └── steamapps/
 ├── compatibilitytools/
 ├── sysvipc-shim/
+├── run.sh
 ├── run-steam-arm64.sh
 └── steam-ui-watchdog.py
 ```
@@ -96,7 +97,7 @@ The default Proton layout is:
 Set `GE_PROTON_ARM64_ROOT` when starting Steam if the bundle lives elsewhere:
 
 ```sh
-GE_PROTON_ARM64_ROOT=/path/to/GE-Proton11-6-aarch64 ./run-steam-arm64.sh
+GE_PROTON_ARM64_ROOT=/path/to/GE-Proton11-6-aarch64 ./run.sh
 ```
 
 `extract-steam-seed.py ARCHIVE DESTINATION` is available for an initial ZIP
@@ -112,6 +113,7 @@ The helper scripts use only the Python standard library. The host/chroot needs:
 - Bash and Python 3.9 or newer;
 - a C compiler and `make` to build the semaphore shim;
 - `mount` and `mountpoint` from util-linux;
+- `sudo` when the chroot user is not root;
 - `fuser` from psmisc for guarded stale-shared-memory cleanup; and
 - the normal runtime and graphics dependencies required by the supplied ARM64
   Steam and Proton builds.
@@ -129,26 +131,40 @@ git clone https://github.com/KiralyCraft/SteamAndroidTermux.git
 cd SteamAndroidTermux
 ```
 
-Then build and test the C shim:
+Optionally build and test the C shim up front:
 
 ```sh
 make -C sysvipc-shim clean all test
 ```
 
-Create the chroot-local shared-memory mount. It is intentionally temporary and
-must be recreated after the enclosing environment tears it down:
+The recommended entry point creates the chroot-local `/dev/shm` directory,
+mounts a 512 MiB tmpfs there when needed, rebuilds an absent or outdated C
+shim, checks the X display, applies the tested software-CEF flags, and starts
+the lower-level launcher and UI watchdog:
 
 ```sh
-sudo mkdir -p /dev/shm
-sudo mount -t tmpfs -o size=512M,nosuid,nodev,mode=1777 tmpfs /dev/shm
+./run.sh
 ```
 
-Make sure the X display is available in the shell, then launch Steam:
+It defaults to `DISPLAY=:0`; set `DISPLAY` first if the X server uses another
+display. Mounting requires root, so `run.sh` invokes `sudo` only when it must
+create or mount `/dev/shm`. An existing non-tmpfs mount or a non-empty unmounted
+directory is rejected rather than hidden.
+
+The equivalent manual mount and lower-level launch are:
 
 ```sh
 export DISPLAY=:0
-./run-steam-arm64.sh
+sudo mkdir -p /dev/shm
+sudo mount -t tmpfs -o size=512M,nosuid,nodev,mode=1777 tmpfs /dev/shm
+./run-steam-arm64.sh -cef-disable-gpu -cef-disable-gpu-compositing
 ```
+
+Set `STEAM_ARM64_SHM_SIZE` to override the tmpfs size. Set
+`STEAM_ARM64_CEF_GPU=1` only to experiment with Steam's CEF GPU path instead of
+the tested `-cef-disable-gpu -cef-disable-gpu-compositing` defaults.
+`STEAM_ARM64_PREPARE_ONLY=1 ./run.sh` performs the preparation and checks
+without starting another Steam process.
 
 The launcher refuses to start if `Steam/steamrtarm64/steam`, the semaphore
 shim, or the `/dev/shm` mount is missing. It creates only one managed symlink in
@@ -226,7 +242,7 @@ per-game log there when enabled by the launcher.
 For a diagnostic run without the SteamUI patch, disable the workaround:
 
 ```sh
-STEAM_ARM64_UI_WORKAROUND=0 ./run-steam-arm64.sh
+STEAM_ARM64_UI_WORKAROUND=0 ./run.sh
 ```
 
 This also skips the direct GUI launch bridge, but still loads the semaphore
@@ -247,6 +263,8 @@ Do not remove `/dev/shm` semaphore state while Steam is running.
 - `extract-steam-seed.py` safely extracts an initial client ZIP.
 - `verify-installed-steam.py` validates file types and sizes against Steam's
   installed bootstrap manifest.
+- `run.sh` is the recommended entry point; it prepares `/dev/shm`, builds the
+  shim when needed, validates the X display, and applies the tested CEF flags.
 - `run-steam-arm64.sh` prepares the runtime, guarded shared-memory cleanup, and
   UI watchdog.
 - `steam-ui-watchdog.py` repairs post-login SteamUI, Library data, GUI install,
