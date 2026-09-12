@@ -1,0 +1,12 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+proton_root=${GE_PROTON_ARM64_ROOT:-/opt/proton-ge/GE-Proton11-6-aarch64}
+proton_entrypoint="${proton_root}/proton"
+
+if [[ ! -x "${proton_entrypoint}" ]]; then
+    echo "ARM64 GE-Proton entry point is missing: ${proton_entrypoint}" >&2
+    exit 127
+fi
+
+exec "${proton_entrypoint}" "$@"

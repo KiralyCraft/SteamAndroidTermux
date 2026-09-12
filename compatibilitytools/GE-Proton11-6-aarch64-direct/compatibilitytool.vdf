@@ -1,0 +1,13 @@
+"compatibilitytools"
+{
+  "compat_tools"
+  {
+    "GE-Proton11-6-aarch64-direct"
+    {
+      "install_path" "."
+      "display_name" "GE-Proton11-6-aarch64 (direct)"
+      "from_oslist" "windows"
+      "to_oslist" "linux"
+    }
+  }
+}

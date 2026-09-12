@@ -13,8 +13,10 @@ import argparse
 import base64
 import json
 import os
+import signal
 import socket
 import struct
+import subprocess
 import sys
 import time
 import urllib.error
@@ -166,6 +168,18 @@ STATE_EXPRESSION = """(()=>{
 })()"""
 
 
+WORKAROUND_STATE_EXPRESSION = """(()=>({
+  libraryRepair: typeof globalThis.__arm64RepairLibrary === "function",
+  installFallback: typeof globalThis.__arm64OriginalInstallApp === "function",
+  detailsFallback: typeof globalThis.__arm64EnsureAppDetails === "function",
+  compatFallback: typeof globalThis.__arm64OriginalSpecifyCompatTool === "function",
+  launchFallback: typeof globalThis.__arm64OriginalRunGame === "function",
+  terminateFallback: typeof globalThis.__arm64OriginalTerminateApp === "function",
+  overviewListener: globalThis.__arm64LibraryChangeRegistered === true,
+  navigationListener: globalThis.__arm64NavigationListenerInstalled === true
+}))()"""
+
+
 START_UI_EXPRESSION = """(()=>{
   const app = globalThis.App;
   if (!app || app.LoginState !== 4 || app.m_bStartedInitAfterLogin)
@@ -204,6 +218,38 @@ COMPLETE_LOGIN_EXPRESSION = """(async()=>{
   const accountName = globalThis.loginStore?.accountName || "";
   await app.OnLoginStateChange(accountName, 5, 1, 0, 0, "");
   return app.LoginState === 5 && app.BHasCurrentUser();
+})()"""
+
+
+RESTORE_LIBRARY_ROUTE_EXPRESSION = """(()=>{
+  try {
+    if (!globalThis.__arm64WebpackRequire) {
+      globalThis.webpackChunksteamui.push([
+        [987654323], {}, require => globalThis.__arm64WebpackRequire = require
+      ]);
+    }
+    const routing = globalThis.__arm64WebpackRequire(49171).z;
+    const route = localStorage.getItem("__arm64LastDesktopRoute") || "";
+    if (!route.startsWith("/library"))
+      return {restored:false, route};
+    if (!routing?.m_history)
+      return {restored:false, route, reason:"history unavailable"};
+    if (routing.m_locationPathname !== route) {
+      routing.m_history.replace(route);
+      return {restored:true, route};
+    }
+    return {restored:false, route};
+  } catch (error) {
+    return {restored:false, reason:String(error)};
+  }
+})()"""
+
+
+TAKE_GAME_REQUEST_EXPRESSION = """(()=>{
+  const raw = localStorage.getItem("__arm64GameRequest");
+  if (raw !== null)
+    localStorage.removeItem("__arm64GameRequest");
+  return raw;
 })()"""
 
 
@@ -268,6 +314,21 @@ def _read_appinfo_object(
     raise ValueError("unterminated appinfo object")
 
 
+def _localized_asset(value: object) -> str:
+    """Return the English (or first available) filename from an appinfo asset."""
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, dict):
+        return ""
+    english = value.get("english")
+    if isinstance(english, str):
+        return english
+    for candidate in value.values():
+        if isinstance(candidate, str):
+            return candidate
+    return ""
+
+
 def read_cached_games(appinfo_path: Path) -> list[dict[str, object]]:
     data = appinfo_path.read_bytes()
     if len(data) < 20 or struct.unpack_from("<I", data)[0] != APPINFO_MAGIC:
@@ -299,13 +360,107 @@ def read_cached_games(appinfo_path: Path) -> list[dict[str, object]]:
         if isinstance(common, dict):
             name = common.get("name")
             app_type = common.get("type")
+            oslist = common.get("oslist", "")
             if (
                 isinstance(name, str)
                 and name
                 and isinstance(app_type, str)
                 and app_type.casefold() == "game"
             ):
-                games.append({"appid": app_id, "name": name})
+                advertised_platforms = {
+                    platform.strip().casefold()
+                    for platform in str(oslist).split(",")
+                    if platform.strip()
+                }
+                config = appinfo.get("config", {})
+                if not isinstance(config, dict):
+                    config = {}
+                install_dir = config.get("installdir", "")
+                if not isinstance(install_dir, str):
+                    install_dir = ""
+                windows_executable = ""
+                launch_options = config.get("launch", {})
+                if isinstance(launch_options, dict):
+                    for launch_option in launch_options.values():
+                        if not isinstance(launch_option, dict):
+                            continue
+                        launch_config = launch_option.get("config", {})
+                        launch_oslist = ""
+                        if isinstance(launch_config, dict):
+                            launch_oslist = str(launch_config.get("oslist", ""))
+                        executable = launch_option.get("executable", "")
+                        if (
+                            isinstance(executable, str)
+                            and executable
+                            and "windows"
+                            in {
+                                platform.strip()
+                                for platform in launch_oslist.casefold().split(",")
+                            }
+                        ):
+                            windows_executable = executable
+                            break
+                header = common.get("header_image", {})
+                full_assets = common.get("library_assets_full", {})
+                if not isinstance(full_assets, dict):
+                    full_assets = {}
+
+                def full_asset_filename(asset_name: str, image_name: str) -> str:
+                    asset = full_assets.get(asset_name, {})
+                    if not isinstance(asset, dict):
+                        return ""
+                    return _localized_asset(asset.get(image_name, {}))
+
+                logo_asset = full_assets.get("library_logo", {})
+                logo_position: dict[str, object] = {}
+                if isinstance(logo_asset, dict):
+                    raw_position = logo_asset.get("logo_position", {})
+                    if isinstance(raw_position, dict):
+                        pinned_position = raw_position.get("pinned_position")
+                        if isinstance(pinned_position, str):
+                            logo_position["pinnedPosition"] = pinned_position
+                        for source_key, target_key in (
+                            ("width_pct", "nWidthPct"),
+                            ("height_pct", "nHeightPct"),
+                        ):
+                            try:
+                                logo_position[target_key] = float(
+                                    raw_position[source_key]
+                                )
+                            except (KeyError, TypeError, ValueError):
+                                pass
+
+                games.append(
+                    {
+                        "appid": app_id,
+                        "name": name,
+                        "icon_hash": str(common.get("icon", "")),
+                        "header_image": _localized_asset(header),
+                        "library_capsule": full_asset_filename(
+                            "library_capsule", "image"
+                        ),
+                        "library_hero": full_asset_filename("library_hero", "image"),
+                        "library_hero_2x": full_asset_filename(
+                            "library_hero", "image2x"
+                        ),
+                        "library_logo": full_asset_filename("library_logo", "image"),
+                        "library_logo_2x": full_asset_filename(
+                            "library_logo", "image2x"
+                        ),
+                        "logo_position": logo_position,
+                        "store_asset_mtime": (
+                            int(common.get("store_asset_mtime", 0))
+                            if str(common.get("store_asset_mtime", 0)).isdigit()
+                            else 0
+                        ),
+                        "install_dir": install_dir,
+                        "windows_executable": windows_executable,
+                        "use_direct_proton": (
+                            "windows" in advertised_platforms
+                            and "linux" not in advertised_platforms
+                        ),
+                    }
+                )
         position = next_record
 
     games.sort(key=lambda game: str(game["name"]).casefold())
@@ -333,9 +488,288 @@ def find_appinfo_path(pid: int | None) -> Path | None:
     return None
 
 
+def read_installed_app_ids(appinfo_path: Path) -> set[int]:
+    """Return AppIDs whose local Steam manifests have the fully-installed bit."""
+    steamapps = appinfo_path.parent.parent / "steamapps"
+    installed: set[int] = set()
+    for manifest in steamapps.glob("appmanifest_*.acf"):
+        try:
+            app_id = int(manifest.stem.removeprefix("appmanifest_"))
+            text = manifest.read_text(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            continue
+        marker = '"StateFlags"'
+        position = text.find(marker)
+        if position < 0:
+            continue
+        remainder = text[position + len(marker) :]
+        fields = remainder.split('"', 2)
+        if len(fields) < 2:
+            continue
+        try:
+            state_flags = int(fields[1])
+        except ValueError:
+            continue
+        if state_flags & 4:
+            installed.add(app_id)
+    return installed
+
+
+class GameProcessManager:
+    """Launch the Windows depot through direct ARM64 Proton for repaired SteamUI."""
+
+    def __init__(self, appinfo_path: Path | None):
+        self.appinfo_path = appinfo_path
+        self.processes: dict[int, dict[str, object]] = {}
+        self.installed_app_ids = (
+            read_installed_app_ids(appinfo_path) if appinfo_path else set()
+        )
+
+    @property
+    def steam_root(self) -> Path | None:
+        if self.appinfo_path is None:
+            return None
+        return self.appinfo_path.parent.parent
+
+    def installed_apps_changed(self) -> bool:
+        if self.appinfo_path is None:
+            return False
+        current = read_installed_app_ids(self.appinfo_path)
+        if current == self.installed_app_ids:
+            return False
+        self.installed_app_ids = current
+        return True
+
+    def _game(self, app_id: int) -> dict[str, object] | None:
+        if self.appinfo_path is None:
+            return None
+        try:
+            games = read_cached_games(self.appinfo_path)
+        except (OSError, ValueError, struct.error):
+            return None
+        return next((game for game in games if game["appid"] == app_id), None)
+
+    def launch(self, app_id: int) -> bool:
+        active = self.processes.get(app_id)
+        if active and active["process"].poll() is None:
+            return True
+        if app_id not in self.installed_app_ids:
+            log(f"refusing launch for AppID {app_id}: it is not fully installed")
+            return False
+
+        game = self._game(app_id)
+        steam_root = self.steam_root
+        if game is None or steam_root is None:
+            log(f"refusing launch for AppID {app_id}: app metadata is unavailable")
+            return False
+        install_dir = game.get("install_dir")
+        executable = game.get("windows_executable")
+        if not isinstance(install_dir, str) or not install_dir:
+            log(f"refusing launch for AppID {app_id}: install directory is unavailable")
+            return False
+        if not isinstance(executable, str) or not executable:
+            log(f"refusing launch for AppID {app_id}: Windows launch option is unavailable")
+            return False
+
+        common_root = (steam_root / "steamapps" / "common").resolve()
+        game_dir = (common_root / install_dir).resolve()
+        relative_executable = Path(executable.replace("\\", "/"))
+        if relative_executable.is_absolute() or ".." in relative_executable.parts:
+            log(f"refusing launch for AppID {app_id}: unsafe executable path")
+            return False
+        executable_path = (game_dir / relative_executable).resolve()
+        if common_root not in game_dir.parents or game_dir not in executable_path.parents:
+            log(f"refusing launch for AppID {app_id}: launch path escaped Steam library")
+            return False
+        if not executable_path.is_file():
+            log(f"refusing launch for AppID {app_id}: Windows executable is missing")
+            return False
+
+        proton = (
+            Path(__file__).resolve().parent
+            / "compatibilitytools"
+            / "GE-Proton11-6-aarch64-direct"
+            / "proton"
+        )
+        if not proton.is_file() or not os.access(proton, os.X_OK):
+            log(f"refusing launch for AppID {app_id}: direct Proton tool is unavailable")
+            return False
+
+        compat_data = steam_root / "steamapps" / "compatdata" / str(app_id)
+        compat_data.mkdir(parents=True, exist_ok=True)
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "STEAM_COMPAT_CLIENT_INSTALL_PATH": str(steam_root),
+                "STEAM_COMPAT_DATA_PATH": str(compat_data),
+                "STEAM_COMPAT_INSTALL_PATH": str(game_dir),
+                "STEAM_COMPAT_APP_ID": str(app_id),
+                "SteamAppId": str(app_id),
+                "SteamGameId": str(app_id),
+                "PROTON_LOG": "1",
+                "PROTON_LOG_DIR": str(steam_root / "logs"),
+            }
+        )
+        supervisor_log = open(
+            steam_root / "logs" / "arm64-game-launcher.log", "ab", buffering=0
+        )
+        try:
+            process = subprocess.Popen(
+                [str(proton), "run", f"./{relative_executable.as_posix()}"],
+                cwd=game_dir,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=supervisor_log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        except OSError as error:
+            supervisor_log.close()
+            log(f"could not launch AppID {app_id}: {error}")
+            return False
+        self.processes[app_id] = {
+            "process": process,
+            "log": supervisor_log,
+            "compat_data": compat_data.resolve(),
+            "terminate_deadline": None,
+        }
+        log(f"launched AppID {app_id} through direct ARM64 Proton")
+        return True
+
+    @staticmethod
+    def _prefix_process_ids(compat_data: Path) -> set[int]:
+        """Return processes carrying this exact Proton data path."""
+        marker = b"STEAM_COMPAT_DATA_PATH=" + os.fsencode(str(compat_data))
+        process_ids: set[int] = set()
+        for proc_entry in Path("/proc").iterdir():
+            if not proc_entry.name.isdigit():
+                continue
+            process_id = int(proc_entry.name)
+            try:
+                environment = (proc_entry / "environ").read_bytes().split(b"\0")
+            except OSError:
+                continue
+            if marker in environment:
+                process_ids.add(process_id)
+        return process_ids
+
+    @staticmethod
+    def _signal_processes(process_ids: set[int], requested_signal: int) -> None:
+        for process_id in process_ids:
+            try:
+                os.kill(process_id, requested_signal)
+            except (PermissionError, ProcessLookupError):
+                pass
+
+    def terminate(self, app_id: int) -> bool:
+        active = self.processes.get(app_id)
+        if not active:
+            return False
+        process = active["process"]
+        prefix_processes = self._prefix_process_ids(active["compat_data"])
+        if process.poll() is not None and not prefix_processes:
+            return False
+        if process.poll() is None:
+            prefix_processes.add(process.pid)
+        self._signal_processes(prefix_processes, signal.SIGTERM)
+        active["terminate_deadline"] = time.monotonic() + 5
+        log(f"requested termination of AppID {app_id}")
+        return True
+
+    def poll(self) -> set[int]:
+        stopped: set[int] = set()
+        for app_id, active in list(self.processes.items()):
+            process = active["process"]
+            deadline = active["terminate_deadline"]
+            supervisor_running = process.poll() is None
+            prefix_processes = self._prefix_process_ids(active["compat_data"])
+            if not supervisor_running and prefix_processes and deadline is None:
+                log(
+                    f"AppID {app_id} launcher exited with Wine processes still active; "
+                    "cleaning up the game prefix"
+                )
+                active["terminate_deadline"] = time.monotonic() + 5
+                deadline = active["terminate_deadline"]
+                self._signal_processes(prefix_processes, signal.SIGTERM)
+            if deadline is not None:
+                requested_signal = (
+                    signal.SIGKILL
+                    if time.monotonic() >= deadline
+                    else signal.SIGTERM
+                )
+                if supervisor_running:
+                    prefix_processes.add(process.pid)
+                self._signal_processes(prefix_processes, requested_signal)
+                if supervisor_running or prefix_processes:
+                    continue
+            elif supervisor_running:
+                continue
+            active["log"].close()
+            del self.processes[app_id]
+            stopped.add(app_id)
+            log(f"AppID {app_id} exited")
+        return stopped
+
+    def running_app_ids(self) -> set[int]:
+        self.poll()
+        return set(self.processes)
+
+
+def synchronize_running_games(port: int, manager: GameProcessManager) -> None:
+    app_ids = sorted(manager.running_app_ids())
+    expression = f"""(()=>{{
+      const next = new Set({json.dumps(app_ids)});
+      const current = globalThis.__arm64ExternalRunningIDs || new Set();
+      const changed = current.size !== next.size || [...current].some(id => !next.has(id));
+      const managed = globalThis.__arm64ManagedAppIDs || new Set();
+      next.forEach(id => managed.add(id));
+      globalThis.__arm64ManagedAppIDs = managed;
+      const appStore = globalThis.__arm64WebpackRequire?.(1776)?.tw;
+      const stale = [...managed].some(id => {{
+        const status = appStore?.m_mapApps?.get(id)?.per_client_data?.[0]
+          ?.display_status;
+        return status !== (next.has(id) ? 4 : 28);
+      }});
+      if (!changed && !stale)
+        return false;
+      globalThis.__arm64ExternalRunningIDs = next;
+      globalThis.__arm64RepairLibrary?.();
+      clearTimeout(globalThis.__arm64RunningStateRepairTimer);
+      globalThis.__arm64RunningStateRepairTimer = setTimeout(
+        () => globalThis.__arm64RepairLibrary?.(), 500
+      );
+      return true;
+    }})()"""
+    evaluate(port, expression)
+
+
+def handle_game_request(port: int, manager: GameProcessManager) -> None:
+    raw = evaluate(port, TAKE_GAME_REQUEST_EXPRESSION)
+    if not isinstance(raw, str) or not raw:
+        synchronize_running_games(port, manager)
+        return
+    try:
+        request = json.loads(raw)
+        app_id = int(request.get("appid", 0))
+        action = request.get("action")
+    except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+        log("ignored malformed SteamUI game request")
+        synchronize_running_games(port, manager)
+        return
+    if app_id <= 0:
+        log("ignored SteamUI game request with invalid AppID")
+    elif action == "launch":
+        manager.launch(app_id)
+    elif action == "terminate":
+        manager.terminate(app_id)
+    else:
+        log("ignored SteamUI game request with unknown action")
+    synchronize_running_games(port, manager)
+
+
 def build_library_repair_expression(games: list[dict[str, object]]) -> str:
     candidates = json.dumps(games, ensure_ascii=True, separators=(",", ":"))
-    return f"""(async()=>{{
+    return rf"""(async()=>{{
   try {{
     if (!globalThis.__arm64WebpackRequire) {{
       globalThis.webpackChunksteamui.push([
@@ -348,51 +782,325 @@ def build_library_repair_expression(games: list[dict[str, object]]) -> str:
     if (!store || !Change || !globalThis.SteamClient?.Apps)
       return {{accepted:false, reason:"Steam app store unavailable"}};
     const candidates = {candidates};
-    const uncached = candidates.filter(app =>
-      !store.GetAppOverviewByAppID(app.appid)
-    );
-    if (!uncached.length)
-      return {{accepted:true, injected:0, total:store.m_mapApps?.size || 0}};
-    const checks = await Promise.all(uncached.map(async app => {{
+    const checks = await Promise.all(candidates.map(async app => {{
       try {{
         return await SteamClient.Apps.GetIsSubscribedApp(app.appid) ? app : null;
       }} catch (_) {{
         return null;
       }}
     }}));
-    const missing = checks.filter(app => app);
-    if (!missing.length)
-      return {{accepted:true, injected:0, total:store.m_mapApps?.size || 0}};
-    const change = Change.fromObject({{
-      app_overview: missing.map(app => ({{
-        appid: app.appid,
-        display_name: app.name,
-        display_name_elanguage: 0,
-        visible_in_game_list: true,
-        subscribed_to: true,
-        sort_as: app.name,
-        app_type: 1,
-        gameid: String(app.appid),
-        per_client_data: [{{
-          clientid: "0",
-          client_name: "Local Computer",
-          display_status: 0,
-          status_percentage: 0,
-          installed: false,
-          is_available_on_current_platform: true,
-          is_invalid_os_type: false
-        }}],
-        most_available_clientid: "0",
-        selected_clientid: "0",
-        number_of_copies: 1
-      }})),
-      full_update: false,
-      update_complete: true
-    }});
-    const accepted = !!store.UpdateAppOverview(change.serializeBinary());
-    if (accepted)
-      store.m_bIsInitialized = true;
-    return {{accepted, injected:missing.length, total:store.m_mapApps?.size || 0}};
+    const owned = checks.filter(app => app);
+    globalThis.__arm64OwnedLibraryFallback = owned;
+    globalThis.__arm64OwnedLibraryIDs = new Set(owned.map(app => app.appid));
+
+    globalThis.__arm64RepairLibrary = () => {{
+      const fallback = globalThis.__arm64OwnedLibraryFallback;
+      if (!fallback.length) {{
+        store.m_bIsInitialized = true;
+        return {{accepted:true, injected:0, total:store.m_mapApps?.size || 0}};
+      }}
+      const change = Change.fromObject({{
+        app_overview: fallback.map(app => ({{
+          appid: app.appid,
+          display_name: app.name,
+          display_name_elanguage: 0,
+          visible_in_game_list: true,
+          subscribed_to: true,
+          sort_as: app.name,
+          app_type: 1,
+          gameid: String(app.appid),
+          per_client_data: [{{
+            clientid: "0",
+            client_name: "Local Computer",
+            display_status: globalThis.__arm64ExternalRunningIDs?.has(app.appid)
+              ? 4
+              : 28,
+            status_percentage: 0,
+            installed: !!app.installed,
+            is_available_on_current_platform: true,
+            is_invalid_os_type: false
+          }}],
+          most_available_clientid: "0",
+          selected_clientid: "0",
+          number_of_copies: 1,
+          icon_hash: app.icon_hash || "",
+          library_capsule_filename: app.library_capsule || "library_600x900.jpg",
+          header_filename: app.header_image || "header.jpg",
+          rt_store_asset_mtime: app.store_asset_mtime || 0,
+          local_cache_version: 0
+        }})),
+        full_update: false,
+        update_complete: true
+      }});
+      const accepted = !!store.UpdateAppOverview(change.serializeBinary());
+      if (accepted)
+        store.m_bIsInitialized = true;
+      return {{accepted, injected:fallback.length, total:store.m_mapApps?.size || 0}};
+    }};
+
+    if (!globalThis.__arm64LibraryChangeRegistered) {{
+      SteamClient.Apps.RegisterForAppOverviewChanges(() => {{
+        clearTimeout(globalThis.__arm64LibraryRepairTimer);
+        globalThis.__arm64LibraryRepairTimer = setTimeout(
+          () => globalThis.__arm64RepairLibrary?.(), 50
+        );
+      }});
+      globalThis.__arm64LibraryChangeRegistered = true;
+    }}
+
+    const routing = require(49171).z;
+    if (!globalThis.__arm64NavigationListenerInstalled && routing?.m_history?.listen) {{
+      globalThis.__arm64NavigationUnlisten = routing.m_history.listen(location => {{
+        const route = location?.pathname || "";
+        if (route.startsWith("/library") || route === "/browser/")
+          localStorage.setItem("__arm64LastDesktopRoute", route);
+      }});
+      globalThis.__arm64NavigationListenerInstalled = true;
+    }}
+
+    const detailsStore = require(78057).H;
+    globalThis.__arm64EnsureAppDetails = appID => {{
+      const numericAppID = Number(appID);
+      const app = globalThis.__arm64OwnedLibraryFallback.find(
+        candidate => candidate.appid === numericAppID
+      );
+      if (!app || !detailsStore)
+        return false;
+      const existing = detailsStore.GetAppDetails(numericAppID);
+      let compatMappings = {{}};
+      try {{
+        compatMappings = JSON.parse(
+          localStorage.getItem("__arm64CompatToolMappings") || "{{}}"
+        );
+      }} catch (_) {{}}
+      const fallbackAssets = {{
+        strHeroImage: app.library_hero || "library_hero.jpg",
+        strHeroImage_2x: app.library_hero_2x || "",
+        strHeroBlurImage: "",
+        strLogoImage: app.library_logo || "logo.png",
+        strLogoImage_2x: app.library_logo_2x || "",
+        strHeaderImage: app.header_image || "header.jpg",
+        strHeaderImage_2x: "",
+        logoPosition: Object.keys(app.logo_position || {{}}).length
+          ? app.logo_position
+          : {{pinnedPosition:"UpperLeft", nWidthPct:50, nHeightPct:50}}
+      }};
+      const details = Object.assign({{
+        unAppID: numericAppID,
+        strDisplayName: app.name,
+        strDeveloperName: "",
+        strPublisherName: "",
+        strHomepageURL: "",
+        strSupportURL: "",
+        strSelectedBeta: "",
+        strSteamDeckBlogURL: "",
+        bIsSubscribedTo: true,
+        bHasAnyLocalContent: false,
+        bCloudEnabledForAccount: false,
+        bCloudEnabledForApp: false,
+        bCloudAvailable: false,
+        bCloudSyncOnSuspendAvailable: false,
+        bCloudSyncOnSuspendEnabled: false,
+        bCanMoveInstallFolder: false,
+        bHasDifferentCopies: false,
+        bIsExcludedFromSharing: false,
+        bIsThirdPartyUpdater: false,
+        bWorkshopVisible: false,
+        bCommunityMarketPresence: false,
+        bOverlayEnabled: true,
+        bIsAvailableOnPlatform: true,
+        bStorePagePublished: true,
+        bFDMEnable: false,
+        bForceIdentAsSteamDeck: false,
+        bOverrideInternalResolution: false,
+        bRPOEnable: false,
+        unEntitledContentApp: 0,
+        unTimedTrialSecondsAllowed: 0,
+        unTimedTrialSecondsPlayed: 0,
+        eAppOwnershipFlags: 0,
+        eAppUpdateError: 0,
+        eAutoUpdateValue: 0,
+        eBackgroundDownloads: 0,
+        eCloudStatus: 0,
+        eControllerStyle: 0,
+        eControllerType: 0,
+        eDisplayStatus: 28,
+        eEnableThirdPartyControllerConfiguration: 0,
+        eSteamInputControllerMask: 0,
+        eTSOEnable: 0,
+        iInstallFolder: 0,
+        lDiskSpaceRequiredBytes: 0,
+        lDiskUsageBytes: "0",
+        nBuildID: 0,
+        nCloudProgressPercent: 0,
+        nCompatToolPriority: 0,
+        nPlaytimeForever: 0,
+        rtLastTimePlayed: 0,
+        rtLastUpdated: 0,
+        selectedLanguage: "english",
+        strCloudBytesAvailable: "0",
+        strCloudBytesUsed: "0",
+        strCompatExperiment: "",
+        strCompatToolName: "",
+        strInstallFolder: "",
+        strLaunchOptions: "",
+        strResolutionOverride: "",
+        achievements: {{vecHighlight:[], vecUnachieved:[], vecAchievedHidden:[]}},
+        vecChildConfigApps: [],
+        vecDLC: [],
+        vecBetas: [],
+        vecLanguages: [],
+        vecPlatforms: [],
+        vecDeckCompatTestResults: [],
+        vecSteamFrameCompatTestResults: [],
+        vecSteamMachineCompatTestResults: [],
+        vecSteamOSCompatTestResults: [],
+        deckDerivedProperties: {{
+          requires_non_controller_launcher_nav: false,
+          requires_manual_keyboard_invoke: false,
+          small_text: false,
+          hdr_support: 0
+        }}
+      }}, existing || {{}});
+      details.libraryAssets = Object.assign(
+        {{}}, fallbackAssets, existing?.libraryAssets || {{}}
+      );
+      for (const field of [
+        "vecChildConfigApps", "vecDLC", "vecBetas", "vecLanguages",
+        "vecPlatforms",
+        "vecDeckCompatTestResults", "vecSteamFrameCompatTestResults",
+        "vecSteamMachineCompatTestResults", "vecSteamOSCompatTestResults"
+      ]) {{
+        if (!Array.isArray(details[field]))
+          details[field] = [];
+      }}
+      if (!details.strOwnerSteamID)
+        delete details.strOwnerSteamID;
+      if (Object.hasOwn(compatMappings, String(numericAppID))) {{
+        details.strCompatToolName = compatMappings[numericAppID] || "";
+        details.nCompatToolPriority = details.strCompatToolName ? 250 : 0;
+      }}
+      detailsStore.AppDetailsChanged(details);
+      return true;
+    }};
+
+    if (detailsStore && !globalThis.__arm64OriginalRegisterForAppData) {{
+      globalThis.__arm64OriginalRegisterForAppData =
+        detailsStore.RegisterForAppData.bind(detailsStore);
+      detailsStore.RegisterForAppData = (appID, listener) => {{
+        const registration =
+          globalThis.__arm64OriginalRegisterForAppData(appID, listener);
+        queueMicrotask(() => globalThis.__arm64EnsureAppDetails?.(appID));
+        return registration;
+      }};
+    }}
+
+    if (!globalThis.__arm64OriginalSpecifyCompatTool) {{
+      globalThis.__arm64OriginalSpecifyCompatTool =
+        SteamClient.Apps.SpecifyCompatTool.bind(SteamClient.Apps);
+      SteamClient.Apps.SpecifyCompatTool = (appID, toolName) => {{
+        const numericAppID = Number(appID);
+        return Promise.resolve(
+          globalThis.__arm64OriginalSpecifyCompatTool(appID, toolName)
+        ).then(result => {{
+          let compatMappings = {{}};
+          try {{
+            compatMappings = JSON.parse(
+              localStorage.getItem("__arm64CompatToolMappings") || "{{}}"
+            );
+          }} catch (_) {{}}
+          compatMappings[numericAppID] = String(toolName || "");
+          localStorage.setItem(
+            "__arm64CompatToolMappings", JSON.stringify(compatMappings)
+          );
+          globalThis.__arm64EnsureAppDetails?.(numericAppID);
+          return result;
+        }});
+      }};
+    }}
+
+    for (const app of owned) {{
+      if (app.installed)
+        globalThis.__arm64EnsureAppDetails(app.appid);
+    }}
+    const routeAppID = Number(routing?.m_locationPathname?.match(
+      /^\/library\/app\/(\d+)/
+    )?.[1]);
+    if (routeAppID)
+      globalThis.__arm64EnsureAppDetails(routeAppID);
+
+    const actions = require(2444).I;
+    if (actions && !globalThis.__arm64OriginalInstallApp) {{
+      globalThis.__arm64OriginalInstallApp = actions.InstallApp.bind(actions);
+      actions.InstallApp = appID => {{
+        const numericAppID = Number(appID);
+        if (
+          Number.isSafeInteger(numericAppID) &&
+          numericAppID > 0 &&
+          globalThis.__arm64OwnedLibraryIDs.has(numericAppID)
+        ) {{
+          actions.m_unAppIDExpectedInstall = numericAppID;
+          const app = globalThis.__arm64OwnedLibraryFallback.find(
+            candidate => candidate.appid === numericAppID
+          );
+          const install = () =>
+            SteamClient.Console.ExecCommand(`app_install ${{numericAppID}}`);
+          if (app?.use_direct_proton) {{
+            return Promise.resolve(
+              SteamClient.Apps.SpecifyCompatTool(
+                numericAppID, "GE-Proton11-6-aarch64-direct"
+              )
+            ).then(install);
+          }}
+          return install();
+        }}
+        return globalThis.__arm64OriginalInstallApp(appID);
+      }};
+    }}
+
+    globalThis.__arm64ExternalRunningIDs ||= new Set();
+    if (!globalThis.__arm64OriginalRunGame) {{
+      globalThis.__arm64OriginalRunGame = SteamClient.Apps.RunGame.bind(
+        SteamClient.Apps
+      );
+      SteamClient.Apps.RunGame = (appID, ...args) => {{
+        const numericAppID = Number(appID);
+        const app = globalThis.__arm64OwnedLibraryFallback.find(
+          candidate => candidate.appid === numericAppID
+        );
+        if (app?.installed && app.windows_executable) {{
+          globalThis.__arm64ExternalRunningIDs.add(numericAppID);
+          localStorage.setItem("__arm64GameRequest", JSON.stringify({{
+            action: "launch",
+            appid: numericAppID,
+            serial: `${{Date.now()}}-${{Math.random()}}`
+          }}));
+          globalThis.__arm64RepairLibrary();
+          return;
+        }}
+        return globalThis.__arm64OriginalRunGame(appID, ...args);
+      }};
+    }}
+
+    if (!globalThis.__arm64OriginalTerminateApp) {{
+      globalThis.__arm64OriginalTerminateApp = SteamClient.Apps.TerminateApp.bind(
+        SteamClient.Apps
+      );
+      SteamClient.Apps.TerminateApp = (appID, ...args) => {{
+        const numericAppID = Number(appID);
+        if (globalThis.__arm64ExternalRunningIDs.has(numericAppID)) {{
+          localStorage.setItem("__arm64GameRequest", JSON.stringify({{
+            action: "terminate",
+            appid: numericAppID,
+            serial: `${{Date.now()}}-${{Math.random()}}`
+          }}));
+          return;
+        }}
+        return globalThis.__arm64OriginalTerminateApp(appID, ...args);
+      }};
+    }}
+
+    return globalThis.__arm64RepairLibrary();
   }} catch (error) {{
     return {{accepted:false, reason:String(error)}};
   }}
@@ -415,6 +1123,9 @@ def repair_visual_library(port: int, pid: int | None) -> None:
     if not games:
         log("local appinfo cache contains no games; visual Library repair was skipped")
         return
+    installed_app_ids = read_installed_app_ids(appinfo_path)
+    for game in games:
+        game["installed"] = int(game["appid"]) in installed_app_ids
     result = evaluate(
         port, build_library_repair_expression(games), await_promise=True
     )
@@ -430,6 +1141,12 @@ def repair_visual_library(port: int, pid: int | None) -> None:
     total = int(result.get("total", 0))
     if injected:
         log(f"restored {injected} owned games to the visual Library ({total} total)")
+
+
+def restore_library_route(port: int) -> None:
+    result = evaluate(port, RESTORE_LIBRARY_ROUTE_EXPRESSION)
+    if isinstance(result, dict) and result.get("restored"):
+        log(f"restored the requested SteamUI route {result.get('route')}")
 
 
 def get_state(port: int) -> dict | None:
@@ -449,7 +1166,7 @@ def wait_for_shared_context(port: int, pid: int | None, timeout: float) -> bool:
     return False
 
 
-def run(port: int, pid: int | None, startup_timeout: float) -> int:
+def recover_context(port: int, pid: int | None, startup_timeout: float) -> int:
     if not wait_for_shared_context(port, pid, startup_timeout):
         if process_alive(pid):
             log("CEF debugger did not become ready; leaving Steam untouched")
@@ -483,6 +1200,14 @@ def run(port: int, pid: int | None, startup_timeout: float) -> int:
         break
     else:
         return 1
+
+    state = get_state(port)
+    if state and state.get("loginState") == WAITING_FOR_LIBRARY_STATE:
+        # The native ARM64 client publishes an empty app-overview update. Seed
+        # the store before SteamUI constructs the post-login desktop so a
+        # Library navigation can survive this forced context initialization.
+        repair_visual_library(port, pid)
+        restore_library_route(port)
 
     state = get_state(port)
     if state and not state.get("started"):
@@ -519,6 +1244,58 @@ def run(port: int, pid: int | None, startup_timeout: float) -> int:
     return 1
 
 
+def run(
+    port: int,
+    pid: int | None,
+    startup_timeout: float,
+    game_manager: GameProcessManager,
+) -> int:
+    monitoring = False
+    while process_alive(pid):
+        result = recover_context(port, pid, startup_timeout)
+        if result and not process_alive(pid):
+            return result
+        if result:
+            time.sleep(2)
+            continue
+        if not monitoring:
+            log("monitoring SteamUI for context replacement")
+            monitoring = True
+
+        while process_alive(pid):
+            time.sleep(2)
+            try:
+                state = get_state(port)
+                workaround_state = evaluate(port, WORKAROUND_STATE_EXPRESSION)
+                handle_game_request(port, game_manager)
+                if game_manager.installed_apps_changed():
+                    log("installed app set changed; refreshing the visual Library")
+                    repair_visual_library(port, pid)
+            except (
+                CDPError,
+                OSError,
+                urllib.error.URLError,
+                json.JSONDecodeError,
+            ):
+                continue
+            if state is None:
+                continue
+            if state.get("loginState") != LOGGED_IN_STATE or not (
+                isinstance(workaround_state, dict)
+                and workaround_state.get("libraryRepair")
+                and workaround_state.get("installFallback")
+                and workaround_state.get("detailsFallback")
+                and workaround_state.get("compatFallback")
+                and workaround_state.get("launchFallback")
+                and workaround_state.get("terminateFallback")
+                and workaround_state.get("overviewListener")
+                and workaround_state.get("navigationListener")
+            ):
+                log("SteamUI context changed; reinstalling recovery hooks")
+                break
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=8080)
@@ -526,7 +1303,8 @@ def main() -> int:
     parser.add_argument("--startup-timeout", type=float, default=90)
     args = parser.parse_args()
     try:
-        return run(args.port, args.steam_pid, args.startup_timeout)
+        game_manager = GameProcessManager(find_appinfo_path(args.steam_pid))
+        return run(args.port, args.steam_pid, args.startup_timeout, game_manager)
     except (CDPError, OSError, urllib.error.URLError, json.JSONDecodeError) as error:
         log(f"recovery stopped: {error}")
         return 1
