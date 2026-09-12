@@ -42,6 +42,25 @@ if [[ ! -d "${shm_path}" ]]; then
 fi
 
 if ! mountpoint -q "${shm_path}"; then
+    steam_semaphore_dir="${shm_path}/steam-sysvsem-$(id -u)"
+    mapfile -d '' shm_entries < <(
+        find "${shm_path}" -mindepth 1 -maxdepth 1 -print0
+    )
+    if (( ${#shm_entries[@]} == 1 )) \
+       && [[ "${shm_entries[0]}" == "${steam_semaphore_dir}" ]] \
+       && [[ -d "${steam_semaphore_dir}" && ! -L "${steam_semaphore_dir}" ]] \
+       && [[ $(stat -c %u "${steam_semaphore_dir}") == $(id -u) ]]; then
+        if ! command -v lsof >/dev/null 2>&1; then
+            echo "Refusing to remove stale Steam semaphores without lsof." >&2
+            exit 126
+        fi
+        if lsof -t +D "${steam_semaphore_dir}" >/dev/null 2>&1; then
+            echo "Refusing to remove in-use Steam semaphores from ${shm_path}." >&2
+            exit 126
+        fi
+        echo "Removing a closed, stale Steam semaphore registry from ${shm_path}..."
+        run_as_root find "${steam_semaphore_dir}" -depth -delete
+    fi
     if find "${shm_path}" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
         echo "Refusing to mount over non-empty ${shm_path}" >&2
         exit 126

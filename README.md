@@ -37,6 +37,18 @@ Other AArch64 distributions or X servers may work, but have not been verified.
 This is experimental and tied to undocumented SteamUI internals, so a future
 client update can require changes here.
 
+The client snapshot used for the current verification identifies itself as
+build `1788652215`, with an ARM64 runtime build date of
+`Thu Sep 3 01:26:16 UTC 2026`. Its local payload identifiers are:
+
+- `Steam/package/steam_client_linuxarm64.installed`:
+  `02b5286e36c2b1afb8c81426290a05dfb798154441aa6b3252f2d1df04c962c9`
+- `Steam/steamrtarm64/steam`:
+  `46e6dc8de45924df5c75bc8a79950d40f2fb7752e33d34bb780abec1e50fe69e`
+
+These hashes identify the tested proprietary client files; they are not
+redistributed by this repository. Steam self-updates can change them.
+
 ## What the compatibility layer fixes
 
 `run-steam-arm64.sh` sets the ARM64 runtime paths and preloads the semaphore
@@ -53,15 +65,34 @@ Together they provide the following behavior:
   verified with the logged-in Steam client before being shown in Library.
 - Local artwork metadata is restored for the game list, grid, and app pages.
 - Library routes survive the forced post-login SteamUI initialization.
+- A restored desktop window wider than the X display is resized to the usable
+  monitor width once at startup.
 - Stale, unopened Steam CEF shared-memory objects are removed before startup so
   they cannot fill the deliberately small `/dev/shm` mount.
-- The normal Library Install action schedules `app_install` through Steam's own
-  content service. Downloads, depots, verification, and app manifests remain
-  Steam-managed.
+- The normal Library Install action opens an inline confirmation populated by
+  Steam's install manager, including its location and disk-space calculation.
+  After confirmation, the known-good `app_install` path keeps downloads,
+  depots, verification, and app manifests Steam-managed.
+- When the ARM64 client publishes an empty Downloads callback, the watchdog
+  reconstructs the active transfer from Steam's own app manifest and content
+  log and passes that data to Valve's existing Downloads store. The normal
+  Downloads page, graph, progress bars, and controls remain SteamUI components;
+  the project does not replace the page with custom markup.
+- Steam -> Settings is bridged from the root-menu browser to Valve's shared
+  settings store. This opens the stock settings window and pages rather than a
+  replacement dialog.
+- The selected game's Manage -> Properties action is similarly bridged to
+  Valve's shared app-properties store, preserving the normal General,
+  Compatibility, Updates, and other pages.
 - Properties -> Compatibility can display and persist
   `GE-Proton11-6-aarch64 (direct)` as the selected compatibility tool.
 - Play launches a locally installed Windows executable through the ARM64 Proton
-  bundle, while keeping Steam's Running/Stop state synchronized.
+  bundle with Steam's declared working directory. Games with several Windows
+  launch entries receive a Play-time selector for the requested executable,
+  while Steam's Running/Stop state remains synchronized.
+- On a bare Termux:X11 display without a window manager, the watchdog focuses a
+  newly mapped Wine game window directly. A normal LXDE/Openbox session keeps
+  handling focus itself.
 - Stop terminates only processes carrying that game's exact Proton data path,
   with a short SIGTERM grace period before SIGKILL.
 
@@ -114,9 +145,13 @@ The helper scripts use only the Python standard library. The host/chroot needs:
 - a C compiler and `make` to build the semaphore shim;
 - `mount` and `mountpoint` from util-linux;
 - `sudo` when the chroot user is not root;
-- `fuser` from psmisc for guarded stale-shared-memory cleanup; and
+- `fuser` from psmisc and `lsof` for guarded stale-shared-memory cleanup; and
 - the normal runtime and graphics dependencies required by the supplied ARM64
   Steam and Proton builds.
+
+`xdotool` is also used for the direct keyboard-focus handoff when Steam runs on
+Termux:X11 without an EWMH window manager. It is optional when the display is
+managed by LXDE/Openbox or another compatible window manager.
 
 No Arch `lib32-*` or multilib packages are installed by this repository. It
 also makes no persistent package-manager, udev, or Android-system changes.
@@ -181,13 +216,14 @@ expects additional SteamOS/Steam Frame platform services.
 
 After Library appears:
 
-1. Select an uninstalled game and use its normal blue Install action. The
-   fallback installs into Steam's default library; the folder-selection wizard
-   is not used.
+1. Select an uninstalled game and use its normal blue Install action. Confirm
+   the destination and disk-space estimate in the inline install dialog.
 2. Open Properties -> Compatibility.
 3. Enable **Force the use of a specific Steam Play compatibility tool**.
 4. Select **GE-Proton11-6-aarch64 (direct)**.
-5. Press Play. The entry should change to Running and then expose Stop.
+5. Press Play. If the game publishes several Windows launch entries, choose one
+   in the launch dialog. The entry should change to Running and then expose
+   Stop.
 
 For Windows-only titles, the Install fallback selects the direct tool
 automatically as well. The explicit Properties steps are still useful as a
@@ -218,15 +254,41 @@ available list, capsule, hero, and logo artwork. These numbers describe this
 test account and client cache; they are evidence of the tested flow, not fixed
 project limits.
 
+On 2026-09-13, POSTAL 2 (AppID 223470) exercised the additional desktop flow:
+
+- the stock Downloads page displayed Valve's graph, throttled network rate,
+  downloaded/staged progress, ETA, Pause, Unscheduled, and Download now states;
+- the native content service committed all 3,386,958,736 downloaded bytes and
+  7,974,431,936 staged bytes as build 11052972;
+- Steam -> Settings opened the stock Settings window;
+- Manage -> Properties -> Compatibility showed the enabled direct ARM64 GE
+  Proton mapping and persisted it in Steam's own configuration;
+- Play launched the actual Windows `Postal2.exe` through Proton/FEX after the
+  launcher honored its Steam-declared `System` working directory;
+- Play offered the Windows POSTAL 2, unsupported multiplayer, and Paradise Lost
+  entries instead of silently selecting the first executable; and
+- on the bare Termux:X11 test display, direct focus moved keyboard input from
+  Steam to the newly mapped game window.
+
 ## Current limitations
 
 - The app-overview and Properties repairs depend on SteamUI module internals.
-- GUI Install currently targets only the default Steam library.
+- GUI Install uses Steam's install-manager calculation and an inline dialog,
+  then schedules the download through `app_install`. Alternate-library behavior
+  is only as reliable as the supplied ARM64 client's native storage support.
+- The Downloads bridge currently exposes Steam's one active owned-game
+  transfer. Byte counts come from committed manifest values plus Steam's own
+  aggregate content statistics between manifest flushes, so the live value is
+  an estimate until Steam checkpoints or completes the download.
 - The direct Play bridge handles installed Windows games whose app metadata has
-  a discoverable Windows executable. Complex launch-option pickers and custom
-  command arguments are not yet reproduced.
-- Overlay, cloud synchronization, achievements, controller configuration,
-  SteamVR, and every game-specific Proton behavior are not claimed as working.
+  a discoverable Windows executable. It reproduces a basic multi-entry chooser,
+  but custom launch arguments are not yet passed through.
+- Steam's native Cloud path downloaded POSTAL 2's existing remote data, but the
+  direct launcher does not establish the native launch session needed for a
+  confirmed automatic post-exit upload. Full Cloud save round trips are not yet
+  claimed as working.
+- Overlay, achievements, controller configuration, SteamVR, and every
+  game-specific Proton behavior are not claimed as working.
 - The semaphore implementation is intentionally incomplete and appropriate
   only for a local, single-user Steam process tree. See
   `sysvipc-shim/README.md` for its exact scope.
