@@ -30,6 +30,21 @@ Then start the installed client:
 ./run-steam-arm64.sh
 ```
 
+The launcher also starts `steam-ui-watchdog.py`. The current native ARM64
+client can authenticate and connect successfully but remain in
+`WaitingForLibraryReady`, which prevents SteamUI from receiving its final
+logged-in transition. The watchdog waits five seconds for the native path,
+then performs the missed UI initialization through Steam's localhost-only CEF
+debugger. If the unavailable Friends Chat interface leaves its optional startup
+promise pending, the watchdog releases that gate after its built-in timeout.
+
+The workaround does not read or print credentials and exits after the UI is
+ready. Disable it for an unmodified diagnostic launch with:
+
+```sh
+STEAM_ARM64_UI_WORKAROUND=0 ./run-steam-arm64.sh
+```
+
 The launcher intentionally starts Steam's desktop UI. Passing `-steamdeck`
 forces the SteamOS Gaming Mode shell, which depends on platform components that
 are not present in this chroot and can remain stuck on its startup spinner.
@@ -44,6 +59,8 @@ mount and prints the command needed to restore it.
 - `verify-installed-steam.py` checks the installed manifest's directory,
   symlink, regular-file, and size records.
 - `run-steam-arm64.sh` supplies the local runtime paths and semaphore preload.
+- `steam-ui-watchdog.py` recovers the ARM64 client's missed post-login UI
+  handoff without external Python packages.
 - `sysvipc-shim/` contains the C source, test program, and build rules.
 
 Steam itself, downloaded archives, logs, traces, and generated binaries are
